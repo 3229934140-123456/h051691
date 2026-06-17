@@ -40,5 +40,6 @@ in-memory implementation used by the demo and test suite.
 """
 
 from .snapshotter import Snapshotter, InMemorySnapshotProvider
+from .mysql_provider import MySQLSnapshotProvider
 
-__all__ = ["Snapshotter", "InMemorySnapshotProvider"]
+__all__ = ["Snapshotter", "InMemorySnapshotProvider", "MySQLSnapshotProvider"]

@@ -14,6 +14,7 @@ from ..models.event import (
     ColumnValue,
     EventEnvelope,
     SnapshotEvent,
+    build_dedup_key,
     build_idempotency_key,
     make_event_id,
 )
@@ -216,6 +217,12 @@ class Snapshotter:
                         event_type="snapshot",
                         pk=pk,
                     )
+                    dedup = build_dedup_key(
+                        source=self._source,
+                        database=db,
+                        table=tbl,
+                        pk=pk,
+                    )
                     env = EventEnvelope(
                         event_id=make_event_id(),
                         event_type="snapshot",
@@ -227,6 +234,7 @@ class Snapshotter:
                         timestamp=snap_pos.timestamp,
                         transaction_id=None,
                         idempotency_key=idem,
+                        dedup_key=dedup,
                     )
                     on_row(env)
             _LOG.info("     %d row(s) snapshotted", total)

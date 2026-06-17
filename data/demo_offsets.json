@@ -1,0 +1,9 @@
+{
+  "position": {
+    "binlog_file": "mysql-bin-changelog.000001",
+    "position": 2180,
+    "gtid": null,
+    "timestamp": 1781670466.7037773
+  },
+  "persisted_at": 1781670477.2488945
+}

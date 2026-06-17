@@ -97,6 +97,12 @@ class OffsetManager:
         with self._lock:
             return self._committed
 
+    @property
+    def snapshot_in_progress(self) -> bool:
+        """True while the initial snapshot phase is running."""
+        with self._lock:
+            return self._snapshot_mode_active
+
     def mark_snapshot_in_progress(self) -> None:
         """Signal that a full snapshot is about to begin.
 

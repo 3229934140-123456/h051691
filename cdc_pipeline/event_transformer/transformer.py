@@ -19,6 +19,7 @@ from ..models.event import (
     SchemaChangeEvent,
     TransactionBeginEvent,
     TransactionCommitEvent,
+    build_dedup_key,
     build_idempotency_key,
     make_event_id,
 )
@@ -95,6 +96,12 @@ class EventTransformer:
             event_type="row",
             pk=pk or None,
         )
+        dedup = build_dedup_key(
+            source=self._source,
+            database=raw.database,
+            table=raw.table,
+            pk=pk or None,
+        )
 
         return EventEnvelope(
             event_id=make_event_id(),
@@ -107,6 +114,7 @@ class EventTransformer:
             timestamp=ts,
             transaction_id=raw.transaction_id,
             idempotency_key=idem,
+            dedup_key=dedup,
         )
 
     def transform_tx_begin(self, raw: RawTransactionBegin) -> EventEnvelope:

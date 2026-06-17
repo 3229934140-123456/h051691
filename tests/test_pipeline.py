@@ -558,6 +558,143 @@ class TestCDCPipelineEndToEnd(unittest.TestCase):
         for k in row_new:
             self.assertFalse(k.startswith("col_"), f"bad column name: {k}")
 
+    # ------------------------------------------------------------------
+    # Test: dedup_key lets downstream collapse snapshot + incremental
+    # updates of the *same* primary key into a single final event.
+    # ------------------------------------------------------------------
+    def test_dedup_key_collapses_snapshot_and_update_to_one(self) -> None:
+        users_schema = _make_users_schema()
+        config = _build_config(self._tmpdir, snapshot=True)
+        snap_rows = [[1, "Alice", 30]]
+        provider = InMemorySnapshotProvider()
+        provider.add_table(users_schema, snap_rows)
+        snap_pos = BinlogPosition(
+            binlog_file="mysql-bin-changelog.000001",
+            position=4,
+            timestamp=time.time(),
+        )
+        provider.set_snapshot_position(snap_pos)
+
+        stream = SimulatedLogStream(events_per_second=10_000)
+        stream.set_schema("app", "users", users_schema)
+        stream.rotate("mysql-bin-changelog.000001")
+        stream.begin_tx()
+        stream.update(
+            "app", "users",
+            [1, "Alice", 30],
+            [1, "Alice Smith", 31],
+        )
+        stream.commit_tx()
+
+        consumer = InMemoryDownstreamConsumer()
+        pipeline = CDCPipeline(
+            config, log_parser=stream, snapshot_provider=provider,
+        )
+        pipeline.attach_consumer(consumer)
+        pipeline.start()
+        self.addCleanup(pipeline.stop)
+
+        self._sleep_until(
+            lambda: len(consumer.events) >= 4,
+            timeout=10.0,
+        )
+
+        # Every row/snapshot event must carry a dedup_key.
+        row_events = [e for e in consumer.events
+                      if e.event_type in ("row", "snapshot")]
+        self.assertEqual(len(row_events), 2)  # 1 snapshot + 1 update
+        for ev in row_events:
+            self.assertIsNotNone(ev.dedup_key, f"{ev.event_type} has no dedup_key")
+            self.assertIn("id=", ev.dedup_key or "")
+
+        # Collapsing by dedup_key should leave exactly 1 row for pk id=1
+        # (the UPDATE, which has a higher position than the snapshot).
+        latest = consumer.latest_by_dedup_key()
+        self.assertEqual(len(latest), 1)
+        key = list(latest.keys())[0]
+        ev = latest[key]
+        # Winner must be the row event (UPDATE), not the snapshot.
+        self.assertEqual(ev.event_type, "row")
+        self.assertEqual(ev.event.change_type.value, "UPDATE")
+        # Final value must be the post-update version.
+        after = ev.event.after_dict()
+        self.assertEqual(after["name"], "Alice Smith")
+        self.assertEqual(after["age"], 31)
+
+    # ------------------------------------------------------------------
+    # Test: INSERT / UPDATE / DELETE events all carry proper column
+    # names (no col_N fallback) and correct before/after images.
+    # ------------------------------------------------------------------
+    def test_all_event_types_have_proper_column_names_and_pk(self) -> None:
+        users_schema = _make_users_schema()
+        config = _build_config(self._tmpdir, snapshot=False)
+        stream = SimulatedLogStream(events_per_second=10_000)
+        stream.set_schema("app", "users", users_schema)
+        consumer = InMemoryDownstreamConsumer()
+        pipeline = CDCPipeline(config, log_parser=stream)
+        pipeline.attach_consumer(consumer)
+        pipeline.schema_tracker.register_snapshot_schema(
+            users_schema,
+            BinlogPosition("mysql-bin-changelog.000001", 4),
+        )
+
+        stream.begin_tx()
+        stream.insert("app", "users", [1, "Alice", 30])
+        stream.update(
+            "app", "users",
+            [1, "Alice", 30],
+            [1, "Alice Smith", 31],
+        )
+        stream.delete("app", "users", [1, "Alice Smith", 31])
+        stream.commit_tx()
+
+        pipeline.start()
+        self.addCleanup(pipeline.stop)
+
+        self._sleep_until(
+            lambda: len([e for e in consumer.events if e.event_type == "row"]) >= 3,
+            timeout=5.0,
+        )
+        rows = [e for e in consumer.events if e.event_type == "row"]
+        self.assertEqual(len(rows), 3)
+
+        insert_ev, update_ev, delete_ev = rows
+
+        # ---- INSERT ----
+        self.assertEqual(insert_ev.event.change_type, ChangeType.INSERT)
+        self.assertEqual(insert_ev.event.primary_key, {"id": 1})
+        after = insert_ev.event.after_dict()
+        self.assertEqual(set(after.keys()), {"id", "name", "age"})
+        self.assertEqual(after["name"], "Alice")
+        self.assertEqual(after["age"], 30)
+        for k in after:
+            self.assertFalse(k.startswith("col_"), f"INSERT bad col: {k}")
+
+        # ---- UPDATE ----
+        self.assertEqual(update_ev.event.change_type, ChangeType.UPDATE)
+        self.assertEqual(update_ev.event.primary_key, {"id": 1})
+        before = update_ev.event.before_dict()
+        after = update_ev.event.after_dict()
+        self.assertEqual(set(before.keys()), {"id", "name", "age"})
+        self.assertEqual(set(after.keys()), {"id", "name", "age"})
+        self.assertEqual(before["name"], "Alice")
+        self.assertEqual(after["name"], "Alice Smith")
+        for k in list(before.keys()) + list(after.keys()):
+            self.assertFalse(k.startswith("col_"), f"UPDATE bad col: {k}")
+
+        # ---- DELETE ----
+        self.assertEqual(delete_ev.event.change_type, ChangeType.DELETE)
+        self.assertEqual(delete_ev.event.primary_key, {"id": 1})
+        before = delete_ev.event.before_dict()
+        self.assertEqual(set(before.keys()), {"id", "name", "age"})
+        self.assertEqual(before["name"], "Alice Smith")
+        for k in before:
+            self.assertFalse(k.startswith("col_"), f"DELETE bad col: {k}")
+
+        # dedup_key must be present and stable across all three events.
+        keys = {e.dedup_key for e in rows}
+        self.assertEqual(len(keys), 1)  # same pk -> same dedup key
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.WARNING)

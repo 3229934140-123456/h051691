@@ -164,6 +164,7 @@ class EventEnvelope:
     timestamp: float = 0.0
     transaction_id: Optional[str] = None
     idempotency_key: Optional[str] = None
+    dedup_key: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         inner = self.event.to_dict() if hasattr(self.event, "to_dict") else self.event
@@ -178,6 +179,7 @@ class EventEnvelope:
             "timestamp": self.timestamp,
             "transaction_id": self.transaction_id,
             "idempotency_key": self.idempotency_key,
+            "dedup_key": self.dedup_key,
         }
 
 
@@ -196,9 +198,32 @@ def build_idempotency_key(
 
     The same upstream log position + event type + pk always produces the same
     key so downstream systems can safely re-apply the event any number of
-    times and observe the same outcome.
+    times and observe the same outcome.  This key is unique per *event*.
     """
     pk_str = ""
     if pk:
         pk_str = "|".join(f"{k}={pk[k]}" for k in sorted(pk.keys()))
     return f"{source}:{binlog_file or ''}:{position or 0}:{event_type}:{pk_str}"
+
+
+def build_dedup_key(
+    source: str,
+    database: str,
+    table: str,
+    pk: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Build a primary-key-level deduplication key.
+
+    Unlike :func:`build_idempotency_key` (which is unique per event), this
+    key is stable across all events that touch the same row.  Downstream
+    consumers can use it to keep only the latest version of each row, e.g.
+    to collapse a snapshot row and a subsequent UPDATE into a single final
+    result.
+
+    Returns ``None`` if the event has no primary key (e.g. transaction
+    boundaries, schema changes).
+    """
+    if not pk:
+        return None
+    pk_str = "|".join(f"{k}={pk[k]}" for k in sorted(pk.keys()))
+    return f"{source}:{database}:{table}:{pk_str}"

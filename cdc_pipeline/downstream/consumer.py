@@ -105,6 +105,28 @@ class InMemoryDownstreamConsumer(DownstreamConsumer):
             out.append(ev)
         return out
 
+    def latest_by_dedup_key(self) -> Dict[str, EventEnvelope]:
+        """Return the *latest* event per primary-key dedup key.
+
+        Useful for collapsing snapshot + incremental overlap into a single
+        final version of each row.  Events without a dedup_key (e.g.
+        transaction boundaries, DDL) are skipped.
+        """
+        result: Dict[str, EventEnvelope] = {}
+        for ev in self.events:
+            if not ev.dedup_key:
+                continue
+            existing = result.get(ev.dedup_key)
+            if existing is None:
+                result[ev.dedup_key] = ev
+                continue
+            # Keep the one with the higher position (later in log).
+            pos_new = (ev.binlog_file or "", ev.position or 0)
+            pos_old = (existing.binlog_file or "", existing.position or 0)
+            if pos_new > pos_old:
+                result[ev.dedup_key] = ev
+        return result
+
 
 class LoggingDownstreamConsumer(DownstreamConsumer):
     """Pretty-prints every delivered batch at INFO level."""

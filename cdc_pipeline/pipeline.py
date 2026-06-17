@@ -53,6 +53,7 @@ from .log_parser.mysql_binlog import MySQLBinlogParser
 from .offset_manager.manager import OffsetManager
 from .schema_tracker.tracker import SchemaTracker
 from .snapshot.snapshotter import SnapshotDataProvider, Snapshotter
+from .snapshot import MySQLSnapshotProvider
 
 _LOG = logging.getLogger("cdc.pipeline")
 
@@ -122,6 +123,11 @@ class CDCPipeline:
         """Current delivery metrics, or None before :meth:`attach_consumer`."""
         return self._delivery.stats() if self._delivery is not None else None
 
+    @property
+    def snapshot_in_progress(self) -> bool:
+        """True while the initial full snapshot phase is running."""
+        return self._offset_manager.snapshot_in_progress
+
     def start(self) -> None:
         """Start the pipeline.
 
@@ -148,6 +154,12 @@ class CDCPipeline:
             self._delivery.flush()
             self._offset_manager.mark_snapshot_complete(snap_pos)
             start_position = snap_pos
+            # Release snapshot resources (e.g. the consistent-read connection).
+            if hasattr(self._snapshot_provider, "close"):
+                try:
+                    self._snapshot_provider.close()  # type: ignore[union-attr]
+                except Exception:
+                    _LOG.exception("Error closing snapshot provider")
         elif last_committed is not None:
             _LOG.info(
                 "Resuming from persisted offset %s:%d",

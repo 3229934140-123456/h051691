@@ -37,6 +37,7 @@ from .log_parser.simulator import SimulatedLogStream
 from .models.schema import ColumnDef, TableSchema
 from .pipeline import CDCPipeline
 from .sinks import build_sink_from_config
+from .snapshot import MySQLSnapshotProvider
 from .snapshot.snapshotter import InMemorySnapshotProvider
 
 
@@ -190,14 +191,14 @@ def _build_demo_source(
 # CLI
 # ---------------------------------------------------------------------------
 
-def _print_progress(stats: DeliveryStats) -> None:
+def _print_progress(stats: DeliveryStats, phase: str = "STREAMING") -> None:
     """Render a compact status line without spamming the terminal."""
     file = stats.last_delivered_file or "-"
     pos = stats.last_delivered_position or 0
+    phase_tag = f"[{phase:<9}]"
     line = (
-        f"\r[CDC] "
+        f"\r{phase_tag} "
         f"delivered={stats.events_delivered:<8} "
-        f"submitted={stats.events_submitted:<8} "
         f"batches_ok={stats.batches_delivered:<5} "
         f"retries={stats.batches_retried:<4} "
         f"pending_tx={stats.pending_transactions:<3} "
@@ -276,7 +277,7 @@ def main(argv: Optional[list] = None) -> int:
 
     # ---- Build the pipeline ---------------------------------------------
     parser: Any = None
-    snapshot_provider: Optional[InMemorySnapshotProvider] = None
+    snapshot_provider: Any = None
 
     source_kind = "mysql"
     if args.config:
@@ -292,6 +293,8 @@ def main(argv: Optional[list] = None) -> int:
             _build_demo_source(snapshot_provider, parser, snap_pos)
     else:
         parser = MySQLBinlogParser(config.database)
+        if config.snapshot_enabled:
+            snapshot_provider = MySQLSnapshotProvider(config.database)
 
     pipeline = CDCPipeline(
         config,
@@ -302,10 +305,11 @@ def main(argv: Optional[list] = None) -> int:
     progress_counter = {"n": 0}
 
     def on_progress(stats: DeliveryStats) -> None:
-        # Refresh terminal every ~5 metric updates, avoid busy redrawing.
+        # Refresh terminal every ~3 metric updates, avoid busy redrawing.
         progress_counter["n"] += 1
         if progress_counter["n"] % 3 == 0:
-            _print_progress(stats)
+            phase = "SNAPSHOT" if pipeline.snapshot_in_progress else "STREAMING"
+            _print_progress(stats, phase=phase)
 
     pipeline.attach_consumer(sink, on_progress=on_progress)
 
@@ -326,7 +330,8 @@ def main(argv: Optional[list] = None) -> int:
         while not stop_event.is_set():
             stats = pipeline.delivery_stats()
             if stats is not None:
-                _print_progress(stats)
+                phase = "SNAPSHOT" if pipeline.snapshot_in_progress else "STREAMING"
+                _print_progress(stats, phase=phase)
             if not pipeline.is_running():
                 break
             stop_event.wait(0.5)
@@ -334,7 +339,7 @@ def main(argv: Optional[list] = None) -> int:
         pipeline.stop(timeout=10)
         stats = pipeline.delivery_stats()
         if stats is not None:
-            _print_progress(stats)
+            _print_progress(stats, phase="STOPPED")
         print("\n[CDC] Pipeline stopped.", file=sys.stderr)
     return 0
 
