@@ -39,7 +39,7 @@ from typing import Optional
 
 from .config import PipelineConfig
 from .downstream.consumer import DownstreamConsumer
-from .downstream.delivery import DeliveryManager
+from .downstream.delivery import DeliveryManager, DeliveryStats, DeliveryProgressCb
 from .event_transformer.transformer import EventTransformer
 from .log_parser.base import (
     BinlogPosition,
@@ -99,14 +99,28 @@ class CDCPipeline:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def attach_consumer(self, consumer: DownstreamConsumer) -> None:
-        """Register the downstream consumer that will receive events."""
+    def attach_consumer(
+        self,
+        consumer: DownstreamConsumer,
+        on_progress: Optional[DeliveryProgressCb] = None,
+    ) -> None:
+        """Register the downstream consumer that will receive events.
+
+        ``on_progress`` is invoked (under the delivery lock) every time
+        metrics change (submit, ack, retry).  CLI use it to refresh the
+        terminal status line.
+        """
         self._consumer = consumer
         self._delivery = DeliveryManager(
             consumer=consumer,
             config=self._config,
             on_ack=self._offset_manager.ack,
+            on_progress=on_progress,
         )
+
+    def delivery_stats(self) -> Optional[DeliveryStats]:
+        """Current delivery metrics, or None before :meth:`attach_consumer`."""
+        return self._delivery.stats() if self._delivery is not None else None
 
     def start(self) -> None:
         """Start the pipeline.
@@ -219,10 +233,8 @@ class CDCPipeline:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _schema_lookup(self, db: str, table: str):
-        # The transformer calls this without a position; we return the
-        # latest known schema.
-        return self._schema_tracker.schema_at(db, table)
+    def _schema_lookup(self, db: str, table: str, position=None):
+        return self._schema_tracker.schema_at(db, table, position)
 
     # ------------------------------------------------------------------
     # Test/debug helpers

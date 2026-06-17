@@ -54,12 +54,51 @@ _LOG = logging.getLogger("cdc.delivery")
 
 
 @dataclass
+class DeliveryStats:
+    """Snapshot of delivery metrics returned by :meth:`DeliveryManager.stats`.
+
+    Attributes
+    ----------
+    events_submitted:
+        Total events handed in via :meth:`submit` (all types).
+    events_delivered:
+        Total events for which :meth:`DownstreamConsumer.deliver_batch` has
+        returned successfully (snapshot + incremental).
+    batches_delivered:
+        Number of successful batch deliveries.
+    batches_retried:
+        Total number of transient-failure retries across all batches.
+    batches_failed_permanently:
+        Number of batches that eventually failed even after retries.
+    pending_transactions:
+        Number of transactions currently buffered (waiting on COMMIT).
+    pending_non_tx_events:
+        Number of non-transactional events currently in the size/time buffer.
+    last_delivered_position:
+        Highest binlog position acked downstream.
+    """
+
+    events_submitted: int = 0
+    events_delivered: int = 0
+    batches_delivered: int = 0
+    batches_retried: int = 0
+    batches_failed_permanently: int = 0
+    pending_transactions: int = 0
+    pending_non_tx_events: int = 0
+    last_delivered_file: Optional[str] = None
+    last_delivered_position: Optional[int] = None
+
+
+@dataclass
 class TransactionalBatch:
     events: List[EventEnvelope] = field(default_factory=list)
     started_at: float = field(default_factory=time.time)
 
     def append(self, ev: EventEnvelope) -> None:
         self.events.append(ev)
+
+
+DeliveryProgressCb = Callable[[DeliveryStats], None]
 
 
 class DeliveryManager:
@@ -70,16 +109,19 @@ class DeliveryManager:
         consumer: DownstreamConsumer,
         config: PipelineConfig,
         on_ack: Optional[Callable[[BinlogPosition], None]] = None,
+        on_progress: Optional[DeliveryProgressCb] = None,
     ) -> None:
         self._consumer = consumer
         self._config = config
         self._on_ack = on_ack
+        self._on_progress = on_progress
         self._lock = threading.RLock()
         self._pending_transactions: Dict[str, TransactionalBatch] = {}
         self._non_tx_buffer: List[EventEnvelope] = []
         self._buffer_full_at: Optional[float] = None
         self._delivery_thread: Optional[threading.Thread] = None
         self._running = False
+        self._stats = DeliveryStats()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -105,12 +147,25 @@ class DeliveryManager:
     def submit(self, envelope: EventEnvelope) -> None:
         """Hand an envelope to the manager for eventual delivery."""
         with self._lock:
+            self._stats.events_submitted += 1
             tx_id = envelope.transaction_id
             if tx_id and self._config.transaction_boundary_enabled:
                 self._submit_transactional(tx_id, envelope)
             else:
                 self._non_tx_buffer.append(envelope)
                 self._maybe_mark_buffer()
+            self._update_progress_locked()
+
+    # ------------------------------------------------------------------
+    # Public metrics / introspection
+    # ------------------------------------------------------------------
+    def stats(self) -> DeliveryStats:
+        """Return a thread-safe snapshot of the current delivery metrics."""
+        with self._lock:
+            s = DeliveryStats(**self._stats.__dict__)
+            s.pending_transactions = len(self._pending_transactions)
+            s.pending_non_tx_events = len(self._non_tx_buffer)
+            return s
 
     def deliver_snapshot_batch(self, envelopes: List[EventEnvelope]) -> None:
         """Synchronously deliver a batch coming from the initial snapshot.
@@ -172,25 +227,35 @@ class DeliveryManager:
     # Non-transactional buffering
     # ------------------------------------------------------------------
     def _maybe_mark_buffer(self) -> None:
-        if (
-            self._buffer_full_at is None
-            and len(self._non_tx_buffer) >= self._config.downstream_batch_size
-        ):
+        # Record arrival time of FIRST event in the buffer so we can
+        # honour the downstream_flush_interval_ms even if we never
+        # reach downstream_batch_size.  This guarantees small trickles
+        # of non-transactional events still flow to the consumer
+        # promptly instead of waiting until flush()/stop() is called.
+        if self._buffer_full_at is None and self._non_tx_buffer:
             self._buffer_full_at = time.time()
+        if len(self._non_tx_buffer) >= self._config.downstream_batch_size:
+            # Also consider it "ready by size" when we hit the cap; the
+            # loop below checks both size and time.
+            pass
 
     def _delivery_loop(self) -> None:
         flush_interval = self._config.downstream_flush_interval_ms / 1000.0
         while self._running:
             try:
-                time.sleep(min(flush_interval, 0.1))
+                time.sleep(min(flush_interval, 0.05))
                 with self._lock:
                     now = time.time()
-                    over_size = self._buffer_full_at is not None
-                    over_time = (
-                        self._non_tx_buffer
-                        and (self._buffer_full_at or now) - now >= flush_interval
+                    ready_by_size = (
+                        len(self._non_tx_buffer) >= self._config.downstream_batch_size
                     )
-                    if over_size or over_time or (self._non_tx_buffer and flush_interval == 0):
+                    ready_by_time = (
+                        self._non_tx_buffer
+                        and self._buffer_full_at is not None
+                        and (now - self._buffer_full_at) >= flush_interval
+                    )
+                    force_now = self._non_tx_buffer and flush_interval == 0
+                    if ready_by_size or ready_by_time or force_now:
                         self._flush_non_tx_locked()
             except Exception:
                 _LOG.exception("Delivery loop error")
@@ -221,17 +286,49 @@ class DeliveryManager:
                 self._consumer.deliver_batch(batch)
                 break
             except Exception:
+                with self._lock:
+                    self._stats.batches_retried += 1
+                    self._update_progress_locked()
                 sleep_s = min(2 ** attempt, 30)
-                _LOG.exception(
+                _LOG.warning(
                     "Downstream delivery failed on attempt %d; retrying in %.1fs",
                     attempt,
                     sleep_s,
+                    exc_info=True,
                 )
                 time.sleep(sleep_s)
                 if not self._running:
+                    with self._lock:
+                        self._stats.batches_failed_permanently += 1
+                        self._update_progress_locked()
                     raise
 
-        # Success -> ack the highest position in the batch.
+        # Success -> record metrics and ack the highest position in the batch.
         max_pos = batch.max_position()
+        with self._lock:
+            self._stats.batches_delivered += 1
+            self._stats.events_delivered += len(batch.events)
+            if max_pos is not None:
+                self._stats.last_delivered_file = max_pos.binlog_file
+                self._stats.last_delivered_position = max_pos.position
+            self._update_progress_locked()
         if max_pos is not None and self._on_ack is not None:
             self._on_ack(max_pos)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _update_progress_locked(self) -> None:
+        """Fire the progress callback with a stats snapshot.
+
+        Must be called with ``self._lock`` held.
+        """
+        if self._on_progress is None:
+            return
+        snap = DeliveryStats(**self._stats.__dict__)
+        snap.pending_transactions = len(self._pending_transactions)
+        snap.pending_non_tx_events = len(self._non_tx_buffer)
+        try:
+            self._on_progress(snap)
+        except Exception:
+            _LOG.exception("Progress callback raised")

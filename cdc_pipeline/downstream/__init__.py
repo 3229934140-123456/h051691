@@ -39,7 +39,7 @@ from .consumer import (
     InMemoryDownstreamConsumer,
     LoggingDownstreamConsumer,
 )
-from .delivery import DeliveryManager, TransactionalBatch
+from .delivery import DeliveryManager, TransactionalBatch, DeliveryStats
 
 __all__ = [
     "DownstreamConsumer",
@@ -47,4 +47,5 @@ __all__ = [
     "LoggingDownstreamConsumer",
     "DeliveryManager",
     "TransactionalBatch",
+    "DeliveryStats",
 ]

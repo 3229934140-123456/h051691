@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, TYPE_CHECKING
 
 from ..log_parser.base import (
+    BinlogPosition,
     RawDDLChange,
     RawRowChange,
     RawTransactionBegin,
@@ -23,20 +24,28 @@ from ..models.event import (
 )
 from ..models.schema import TableSchema
 
+if TYPE_CHECKING:
+    SchemaAtFn = Callable[[str, str, Optional[BinlogPosition]], Optional[TableSchema]]
+else:
+    SchemaAtFn = Any
+
 
 class EventTransformer:
     """Converts raw parser records into envelope-wrapped CDC events.
 
     The transformer is *stateless* -- all schema lookups are delegated to
     an injected :class:`SchemaTracker` which owns the per-table versioned
-    schema history.  This separation makes both components trivial to
-    test in isolation.
+    schema history.  Lookups carry the binlog position so the tracker can
+    return the schema *as it was at that exact point in the log*, which
+    is critical when replaying an old section of the log after a restart
+    where the current table schema is different (columns added, removed,
+    renamed, ...).
     """
 
     def __init__(
         self,
         source_name: str = "mysql",
-        schema_lookup: Optional[Callable[[str, str], Optional[TableSchema]]] = None,
+        schema_lookup: Optional[SchemaAtFn] = None,
     ) -> None:
         self._source = source_name
         self._schema_lookup = schema_lookup
@@ -45,7 +54,7 @@ class EventTransformer:
     # Public conversion API
     # ------------------------------------------------------------------
     def transform_row_change(self, raw: RawRowChange) -> EventEnvelope:
-        schema = self._lookup_schema(raw.database, raw.table)
+        schema = self._lookup_schema(raw.database, raw.table, raw.position)
 
         if raw.operation == "INSERT":
             change_type = ChangeType.INSERT
@@ -199,10 +208,15 @@ class EventTransformer:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _lookup_schema(self, db: str, table: str) -> Optional[TableSchema]:
+    def _lookup_schema(
+        self,
+        db: str,
+        table: str,
+        position: Optional[BinlogPosition] = None,
+    ) -> Optional[TableSchema]:
         if self._schema_lookup is None:
             return None
-        return self._schema_lookup(db, table)
+        return self._schema_lookup(db, table, position)
 
     def _row_to_columns(
         self,

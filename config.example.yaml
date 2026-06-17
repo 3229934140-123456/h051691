@@ -1,0 +1,66 @@
+# CDC Pipeline Example Configuration
+# Copy this file and edit the values to match your environment.
+
+# ---- Source database -------------------------------------------------------
+database:
+  host: 127.0.0.1
+  port: 3306
+  user: root
+  password: ""
+  database: app
+  server_id: 1001
+  connect_timeout: 10
+  read_timeout: 30
+
+# ---- Source selection ------------------------------------------------------
+# Either "simulated" (built-in in-memory demo source) or "mysql" (real binlog).
+source: simulated
+
+# ---- Table filters ---------------------------------------------------------
+# All lists support exact "db.table" format; leave empty to match all.
+include_databases:
+  - app
+exclude_databases: []
+include_tables: []
+exclude_tables: []
+
+# ---- Snapshot --------------------------------------------------------------
+snapshot:
+  enabled: true
+  lock_timeout_seconds: 10
+  chunk_size: 1000
+
+# ---- Delivery --------------------------------------------------------------
+delivery:
+  batch_size: 64
+  flush_interval_ms: 250
+  transaction_boundary_enabled: true
+  idempotency_key_enabled: true
+
+# ---- Offset / schema persistence ------------------------------------------
+offset_storage:
+  type: file
+  path: ./data/cdc_offsets.json
+  flush_interval_ms: 1000
+
+schema_storage:
+  type: file
+  path: ./data/cdc_schema_history.json
+
+# ---- Downstream sink (choose ONE active sink) ------------------------------
+# Supported sink types: log, memory, stdout, jsonl, webhook
+sink:
+  type: stdout
+
+  # --- jsonl sink options ---
+  # path: ./data/events.jsonl
+  # dedupe_index_path: ./data/events.idx     # enables restart dedup at sink level
+
+  # --- webhook sink options ---
+  # url: http://localhost:8080/cdc/events
+  # timeout_seconds: 10
+  # max_retries: 10
+  # initial_backoff_seconds: 0.5
+  # max_backoff_seconds: 30
+  # extra_headers:
+  #   Authorization: "Bearer my-secret-token"

@@ -17,11 +17,13 @@ run entirely in-memory without a live database.  The tests validate:
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import tempfile
 import time
 import unittest
+from typing import Any, Dict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -365,6 +367,196 @@ class TestCDCPipelineEndToEnd(unittest.TestCase):
         # Offsets should have advanced past the snapshot position.
         self._sleep_until(lambda: pipeline.offset_manager.committed is not None)
         self.assertGreaterEqual(pipeline.offset_manager.committed.position, 4)
+
+    # ------------------------------------------------------------------
+    # Test: row UPDATED during the snapshot phase - downstream should
+    # end up with the post-update (final) value for each primary key.
+    # ------------------------------------------------------------------
+    def test_snapshot_update_overlap_yields_correct_final_state(self) -> None:
+        users_schema = _make_users_schema()
+        config = _build_config(self._tmpdir, snapshot=True)
+        # Snapshot contains the *pre-update* version of id=1.
+        snap_rows = [[1, "Alice", 30]]
+        provider = InMemorySnapshotProvider()
+        provider.add_table(users_schema, snap_rows)
+        snap_pos = BinlogPosition(
+            binlog_file="mysql-bin-changelog.000001",
+            position=4,
+            timestamp=time.time(),
+        )
+        provider.set_snapshot_position(snap_pos)
+
+        # Incremental stream (starting exactly at snap_pos) first updates
+        # id=1 to the *new* value, then inserts id=2.
+        stream = SimulatedLogStream(events_per_second=10_000)
+        stream.set_schema("app", "users", users_schema)
+        stream.rotate("mysql-bin-changelog.000001")
+        # Prime events at higher positions (begin_tx jumps them past 4).
+        stream.begin_tx()
+        stream.update(
+            "app", "users",
+            [1, "Alice", 30],
+            [1, "Alice Smith", 31],   # id=1 updated during snapshot
+        )
+        stream.insert("app", "users", [2, "Bob", 25])
+        stream.commit_tx()
+
+        consumer = InMemoryDownstreamConsumer()
+        pipeline = CDCPipeline(
+            config, log_parser=stream, snapshot_provider=provider,
+        )
+        pipeline.attach_consumer(consumer)
+        pipeline.start()
+        self.addCleanup(pipeline.stop)
+
+        # 1 snapshot row + 1 tx (begin + UPDATE row + INSERT row + commit) = 5 events
+        self._sleep_until(
+            lambda: len(consumer.events) >= 5,
+            timeout=10.0,
+        )
+        time.sleep(0.5)
+
+        # Replay all unique events in *delivery order* and build the
+        # final materialised view (dict pk -> row).
+        materialised: Dict[Any, Dict[str, Any]] = {}
+        for ev in consumer.unique_events():
+            if ev.event_type == "snapshot":
+                row = ev.event.row_dict()
+                pk = tuple(ev.event.primary_key.items())
+                materialised[pk] = row
+            elif ev.event_type == "row":
+                inner = ev.event
+                pk = tuple(inner.primary_key.items())
+                if inner.change_type == ChangeType.INSERT:
+                    materialised[pk] = inner.after_dict()
+                elif inner.change_type == ChangeType.UPDATE:
+                    materialised[pk] = inner.after_dict()
+                elif inner.change_type == ChangeType.DELETE:
+                    materialised.pop(pk, None)
+
+        self.assertEqual(len(materialised), 2)
+        pk1 = (("id", 1),)
+        pk2 = (("id", 2),)
+        # id=1 must reflect the POST-update value.
+        self.assertEqual(materialised[pk1]["name"], "Alice Smith")
+        self.assertEqual(materialised[pk1]["age"], 31)
+        self.assertEqual(materialised[pk2]["name"], "Bob")
+        self.assertEqual(materialised[pk2]["age"], 25)
+
+    # ------------------------------------------------------------------
+    # Test: non-transactional trickle of small events is flushed by
+    # the refresh timer even though downstream_batch_size is never hit.
+    # ------------------------------------------------------------------
+    def test_non_tx_flush_by_timer(self) -> None:
+        config = _build_config(self._tmpdir, snapshot=False)
+        # Batch size is 100 but we'll only emit 3 non-tx events; the
+        # 200ms flush interval must kick them out after ~200ms.
+        config.downstream_batch_size = 100
+        config.downstream_flush_interval_ms = 200
+        # Disable transaction boundaries so single-row inserts don't get
+        # buffered inside a pending tx.
+        config.transaction_boundary_enabled = False
+
+        stream = SimulatedLogStream(events_per_second=10_000)
+        stream.set_schema("app", "users", _make_users_schema())
+        consumer = InMemoryDownstreamConsumer()
+        pipeline = CDCPipeline(config, log_parser=stream)
+        pipeline.attach_consumer(consumer)
+        pipeline.schema_tracker.register_snapshot_schema(
+            _make_users_schema(),
+            BinlogPosition("mysql-bin-changelog.000001", 4),
+        )
+
+        # Emit 3 single-row events WITHOUT wrapping them in tx_begin/commit.
+        stream.insert("app", "users", [1, "A", 10])
+        stream.insert("app", "users", [2, "B", 20])
+        stream.insert("app", "users", [3, "C", 30])
+
+        pipeline.start()
+        self.addCleanup(pipeline.stop)
+
+        # Wait 1 second (5x the 200ms flush interval) - events should
+        # have flowed even though batch size was never hit.
+        self._sleep_until(
+            lambda: len([e for e in consumer.events if e.event_type == "row"]) >= 3,
+            timeout=3.0,
+        )
+        rows = [e for e in consumer.events if e.event_type == "row"]
+        self.assertEqual(len(rows), 3)
+        pks = {tuple(e.event.primary_key.items()) for e in rows}
+        self.assertEqual(pks, {(("id", 1),), (("id", 2),), (("id", 3),)})
+
+    # ------------------------------------------------------------------
+    # Test: schema versions are honoured by log position.  We build a
+    # stream where, *after* a DDL that adds a column, an older row
+    # event position is still decoded using the pre-DDL schema.
+    # ------------------------------------------------------------------
+    def test_schema_lookup_honours_log_position(self) -> None:
+        from cdc_pipeline.schema_tracker.tracker import apply_ddl_to_schema
+
+        old_schema = _make_users_schema()  # id, name, age (3 cols)
+        # Apply ADD COLUMN to produce the new schema.
+        new_schema = apply_ddl_to_schema(
+            "ALTER TABLE users ADD COLUMN email VARCHAR(255) AFTER name",
+            old_schema,
+            "app",
+            "users",
+        )
+        assert new_schema is not None and len(new_schema.columns) == 4
+
+        config = _build_config(self._tmpdir, snapshot=False)
+        stream = SimulatedLogStream(events_per_second=10_000)
+        consumer = InMemoryDownstreamConsumer()
+        pipeline = CDCPipeline(config, log_parser=stream)
+        pipeline.attach_consumer(consumer)
+
+        # Register the OLD schema at position 100 and NEW schema at 500.
+        pos_old = BinlogPosition("mysql-bin-changelog.000001", 100, timestamp=1.0)
+        pos_new = BinlogPosition("mysql-bin-changelog.000001", 500, timestamp=2.0)
+        pipeline.schema_tracker.register_snapshot_schema(old_schema, pos_old)
+        pipeline.schema_tracker.apply_ddl(
+            "app", "users",
+            "ALTER TABLE users ADD COLUMN email VARCHAR(255) AFTER name",
+            pos_new,
+        )
+
+        # Emit a row event *between* the two positions -> 3 cols, OLD schema.
+        stream.set_schema("app", "users", old_schema)
+        stream.rotate("mysql-bin-changelog.000001")
+        # Manually position the stream so the insert lands at ~pos 200.
+        stream._current_pos = 200
+        stream.begin_tx()
+        stream.insert("app", "users", [1, "Alice", 30])  # 3 columns
+        stream.commit_tx()
+
+        # Now emit a row *after* the DDL -> 4 cols, NEW schema.
+        stream.set_schema("app", "users", new_schema)
+        stream._current_pos = 600
+        stream.begin_tx()
+        stream.insert("app", "users", [2, "Bob", "bob@x.com", 25])  # 4 columns
+        stream.commit_tx()
+
+        pipeline.start()
+        self.addCleanup(pipeline.stop)
+
+        self._sleep_until(
+            lambda: len([e for e in consumer.events if e.event_type == "row"]) >= 2
+        )
+        rows = [e for e in consumer.events if e.event_type == "row"]
+
+        # Row at ~pos 200 must use the OLD 3-column schema -> no col_0 anywhere.
+        row_old = rows[0].event.after_dict()
+        self.assertIn("id", row_old)
+        self.assertIn("name", row_old)
+        self.assertIn("age", row_old)
+        for k in row_old:
+            self.assertFalse(k.startswith("col_"), f"bad column name: {k}")
+
+        # Row at ~pos 600 must use the NEW 4-column schema.
+        row_new = rows[1].event.after_dict()
+        self.assertIn("email", row_new)
+        for k in row_new:
+            self.assertFalse(k.startswith("col_"), f"bad column name: {k}")
 
 
 if __name__ == "__main__":
